@@ -41,3 +41,42 @@
 图4
 
 很明显，expression内16位被写满，原来栈内的rbp也被`qrstuvwx`的ASCII码覆盖，产生更多的溢出错误。
+
+## 利用缓冲区漏洞执行 `./malware`
+先分析`malware`这个命令行脚本，它的功能是检查父进程里是否有`dark-calc`，所以我们的任务是在执行`dark-calc`的时候也同时执行了`malware`，并判断炸弹被引爆。接着看`dark-calc.c`。他是一个简单的计算器，先调用之前分析过的有问题的`input`函数进行输入，然后再在输入前面套上`"echo $(("`，在输入后套上`"))"`，把输入转化为一个命令行指令交给`system()`来运行。
+
+问题是，`system`函数有一整套shell语法，并不是只能简单的做运算，我们可以直接尝试输入`$(./attack/malware)`，这样就可以直接执行`malware`了！但是注意到这个输入大于16位，会被`eval`函数截断，所以我们缩短一下，使用linux的匹配查找命令`$(./attack/m*)`，最终成功，具体结果如下：
+
+![](./images/screen_shot5.png)
+图5
+
+显示成功引燃炸弹。从输出中也能明显看到，运行顺序为`dark-calc`，`sh`(用`system`命令调用的shell) ，``malware``
+
+## 用 GDB 检查 main 函数的机器码
+![](./images/screen_shot6.png)
+图6
+
+这个就是简单的保存之前的`rbp`，然后循环：清零`eax`调用`input`函数，再清零`eax`调用`eval`函数。
+
+## 栈空间执行
+先找到`grade_eval`函数，就是判断输入的数是不是4，这也是我们攻击的目标。但是在`main`函数中，却没有调用`grade_eval`。所以为了调用该函数，我们需要利用前面分析过`gets`函数的漏洞。
+
+![](./images/screen_shot7.png)
+图7
+
+在gdb调试中可以看到，从`0x00007ffffffdd000`到`0x00007ffffffff000`这段内存空间是有权限直接执行的，与图1比对，这段内存包含了`input`函数的栈中的返回地址。也就是说，如果我输入的是32位的字符串，那么后8位会刚好覆盖返回地址，只需要让他指向`grade_eval`函数即可，同时还需要保证`rdi`的值是4。那么需要编写24byte的shellcode，我的答案如下：
+```
+    "48 8d 64 24 80 "               lea -0x80(%rsp),%rsp
+    "6a 04 5f "                     push $4; pop %rdi
+    "b8 87 1a 40 00 "               mov $0x401a87,%eax
+    "ff d0 "                        call *%rax
+    "6a 3c 58 "                     push $60; pop %rax
+    "31 ff "                        xor %edi,%edi
+    "0f 05 "                        syscall
+    "90 90"                         nop; nop
+```
+最后把返回地址改为expression的起始地址，也就是shellcode的起始地址。以下为实验成功的截图：
+
+![](./images/screen_shot8.png)
+图8
+
